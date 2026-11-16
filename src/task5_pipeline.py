@@ -1,0 +1,872 @@
+"""
+Task 5: Integrated Data Preprocessing Pipeline with Cross-Validation
+
+This module implements an end-to-end data preprocessing pipeline that combines
+cleaning, scaling, and feature engineering with proper cross-validation to
+prevent data leakage.
+
+Author: MLDS Course
+Date: December 2025
+"""
+
+import matplotlib
+
+matplotlib.use("Agg")  # Use non-interactive backend
+
+import warnings
+from typing import Any
+
+import joblib
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.datasets import make_classification
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.impute import KNNImputer, SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    accuracy_score,
+    auc,
+    confusion_matrix,
+    roc_auc_score,
+    roc_curve,
+)
+from sklearn.model_selection import (
+    GridSearchCV,
+    StratifiedKFold,
+    cross_val_score,
+    learning_curve,
+    train_test_split,
+)
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import MinMaxScaler, RobustScaler, StandardScaler
+
+warnings.filterwarnings("ignore")
+
+
+class OutlierHandler(BaseEstimator, TransformerMixin):
+    """
+    Custom transformer for outlier detection and handling.
+
+    Parameters:
+        method (str): Method for outlier detection
+        strategy (str): Strategy for handling outliers
+        threshold (float): Threshold for detection
+    """
+
+    def __init__(
+        self, method: str = "iqr", strategy: str = "cap", threshold: float = 1.5
+    ):
+        self.method = method
+        self.strategy = strategy
+        self.threshold = threshold
+        self.bounds_ = {}
+
+    def fit(self, X, y=None):
+        """
+        Fit the outlier handler by computing bounds.
+        """
+        X = pd.DataFrame(X) if not isinstance(X, pd.DataFrame) else X
+
+        for col in X.columns:
+            if self.method == "iqr":
+                Q1 = X[col].quantile(0.25)
+                Q3 = X[col].quantile(0.75)
+                IQR = Q3 - Q1
+                lower = Q1 - self.threshold * IQR
+                upper = Q3 + self.threshold * IQR
+                self.bounds_[col] = (lower, upper)
+            elif self.method == "zscore":
+                mean = X[col].mean()
+                std = X[col].std()
+                lower = mean - self.threshold * std
+                upper = mean + self.threshold * std
+                self.bounds_[col] = (lower, upper)
+
+        return self
+
+    def transform(self, X):
+        """
+        Transform data by handling outliers.
+        """
+        X = pd.DataFrame(X) if not isinstance(X, pd.DataFrame) else X.copy()
+
+        if self.strategy == "cap":
+            for col in X.columns:
+                if col in self.bounds_:
+                    lower, upper = self.bounds_[col]
+                    X[col] = X[col].clip(lower=lower, upper=upper)
+        elif self.strategy == "remove":
+            # Mark outliers as NaN for imputation
+            for col in X.columns:
+                if col in self.bounds_:
+                    lower, upper = self.bounds_[col]
+                    mask = (X[col] < lower) | (X[col] > upper)
+                    X.loc[mask, col] = np.nan
+
+        return X.values
+
+
+class FeatureEngineer(BaseEstimator, TransformerMixin):
+    """
+    Custom transformer for feature engineering.
+
+    Parameters:
+        interactions (bool): Whether to create interaction features
+        polynomials (bool): Whether to create polynomial features
+        transformations (bool): Whether to create mathematical transformations
+    """
+
+    def __init__(
+        self,
+        interactions: bool = True,
+        polynomials: bool = False,
+        transformations: bool = True,
+    ):
+        self.interactions = interactions
+        self.polynomials = polynomials
+        self.transformations = transformations
+        self.feature_names_ = []
+        self.n_features_in_ = 0
+
+    def fit(self, X, y=None):
+        """Fit the feature engineer."""
+        self.n_features_in_ = X.shape[1]
+        return self
+
+    def transform(self, X):
+        """
+        Transform data by creating new features.
+        """
+        X_array = np.array(X)
+        features = [X_array]
+
+        # Mathematical transformations
+        if self.transformations:
+            # Log transform (add small constant to avoid log(0))
+            log_features = np.log1p(np.abs(X_array) + 1e-8)
+            features.append(log_features)
+
+            # Square root transform
+            sqrt_features = np.sqrt(np.abs(X_array))
+            features.append(sqrt_features)
+
+        # Interaction features (limited to avoid explosion)
+        if self.interactions and X_array.shape[1] <= 10:
+            n_features = X_array.shape[1]
+            for i in range(min(3, n_features)):
+                for j in range(i + 1, min(3, n_features)):
+                    interaction = X_array[:, i] * X_array[:, j]
+                    features.append(interaction.reshape(-1, 1))
+
+        # Polynomial features (degree 2, limited features)
+        if self.polynomials and X_array.shape[1] <= 5:
+            square_features = X_array**2
+            features.append(square_features)
+
+        return np.hstack(features)
+
+
+class PreprocessingPipeline:
+    """
+    Integrated preprocessing pipeline combining multiple preprocessing steps
+    with proper cross-validation to prevent data leakage.
+    """
+
+    def __init__(self, random_state: int = 42):
+        """
+        Initialize the preprocessing pipeline.
+        """
+        self.random_state = random_state
+        self.pipeline: Pipeline | None = None
+        self.X_train: pd.DataFrame | None = None
+        self.X_test: pd.DataFrame | None = None
+        self.y_train: pd.Series | None = None
+        self.y_test: pd.Series | None = None
+        self.cv_results: dict[str, Any] = {}
+        self.feature_names: list[str] = []
+
+    def create_pipeline(
+        self,
+        imputer_strategy: str = "mean",
+        outlier_method: str = "none",
+        scaler_type: str = "standard",
+        feature_engineering: bool = True,
+        feature_selection: bool = True,
+        n_features: int = 20,
+    ) -> Pipeline:
+        """
+        Create a sklearn pipeline with specified preprocessing steps.
+
+        Parameters:
+            imputer_strategy (str): Strategy for imputation
+            outlier_method (str): Method for outlier detection
+            scaler_type (str): Type of scaler to use
+            feature_engineering (bool): Whether to apply feature engineering
+            feature_selection (bool): Whether to apply feature selection
+            n_features (int): Number of features to select
+
+        Returns:
+            Pipeline: Configured sklearn pipeline
+        """
+        steps: list[tuple[str, Any]] = []
+
+        # Step 1: Imputation
+        if imputer_strategy.lower() == "knn":
+            steps.append(("imputer", KNNImputer(n_neighbors=5)))
+        elif imputer_strategy.lower() in {
+            "mean",
+            "median",
+            "most_frequent",
+            "constant",
+        }:
+            steps.append(("imputer", SimpleImputer(strategy=imputer_strategy)))
+        else:
+            raise ValueError(f"Unsupported imputer_strategy: {imputer_strategy}")
+
+        # Step 2: Outlier handling
+        if outlier_method and outlier_method.lower() != "none":
+            if outlier_method.lower() not in {"iqr", "zscore"}:
+                raise ValueError(f"Unsupported outlier_method: {outlier_method}")
+            steps.append(
+                (
+                    "outlier_handler",
+                    OutlierHandler(
+                        method=outlier_method.lower(),
+                        strategy="cap",
+                        threshold=1.5,
+                    ),
+                )
+            )
+
+        # Step 3: Feature engineering
+        if feature_engineering:
+            steps.append(
+                (
+                    "feature_engineer",
+                    FeatureEngineer(
+                        interactions=True,
+                        polynomials=False,
+                        transformations=True,
+                    ),
+                )
+            )
+
+        # Step 4: Scaling
+        scalers = {
+            "standard": StandardScaler(),
+            "minmax": MinMaxScaler(),
+            "robust": RobustScaler(),
+            "none": "passthrough",
+        }
+        if scaler_type.lower() not in scalers:
+            raise ValueError(f"Unsupported scaler_type: {scaler_type}")
+        steps.append(("scaler", scalers[scaler_type.lower()]))
+
+        # Step 5: Feature selection
+        if feature_selection:
+            steps.append(
+                ("feature_selector", SelectKBest(score_func=f_classif, k=n_features))
+            )
+
+        # Step 6: Classifier
+        steps.append(
+            (
+                "classifier",
+                LogisticRegression(
+                    max_iter=1000, random_state=self.random_state, solver="lbfgs"
+                ),
+            )
+        )
+
+        self.pipeline = Pipeline(steps)
+        return self.pipeline
+
+    def prepare_data(
+        self, X: pd.DataFrame, y: pd.Series, test_size: float = 0.2
+    ) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
+        """
+        Split data into training and testing sets.
+        """
+        self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(  # type: ignore
+            X, y, test_size=test_size, random_state=self.random_state, stratify=y
+        )
+        return self.X_train, self.X_test, self.y_train, self.y_test  # type: ignore
+
+    def fit_pipeline(self, X_train, y_train):
+        """
+        Fit the pipeline on training data.
+        """
+        if self.pipeline is None:
+            self.create_pipeline()
+
+        self.pipeline.fit(X_train, y_train)  # type: ignore
+        return self
+
+    def evaluate_pipeline(self, X_test, y_test) -> dict[str, float]:
+        """
+        Evaluate the fitted pipeline on test data.
+        """
+        assert self.pipeline is not None
+        y_pred = self.pipeline.predict(X_test)
+        y_pred_proba = self.pipeline.predict_proba(X_test)[:, 1]
+
+        return {
+            "accuracy": float(accuracy_score(y_test, y_pred)),
+            "roc_auc": float(roc_auc_score(y_test, y_pred_proba)),
+        }
+
+    def cross_validate(self, X, y, cv: int = 5) -> dict[str, Any]:
+        """
+        Perform cross-validation on the pipeline.
+        """
+        if self.pipeline is None:
+            self.create_pipeline()
+
+        cv_splitter = StratifiedKFold(
+            n_splits=cv, shuffle=True, random_state=self.random_state
+        )
+
+        cv_scores = cross_val_score(
+            self.pipeline, X, y, cv=cv_splitter, scoring="accuracy"
+        )
+
+        self.cv_results = {
+            "scores": cv_scores,
+            "mean": float(cv_scores.mean()),
+            "std": float(cv_scores.std()),
+            "min": float(cv_scores.min()),
+            "max": float(cv_scores.max()),
+        }
+
+        return self.cv_results
+
+    def compare_configurations(
+        self, X, y, configurations: list[dict[str, Any]]
+    ) -> pd.DataFrame:
+        """
+        Compare different pipeline configurations.
+        """
+        results = []
+
+        for i, config in enumerate(configurations):
+            print(f"Evaluating configuration {i + 1}/{len(configurations)}...")
+
+            config_name = config.get("name", f"Config_{i + 1}")
+            pipeline_config = {k: v for k, v in config.items() if k != "name"}
+
+            self.create_pipeline(**pipeline_config)
+            cv_results = self.cross_validate(X, y, cv=5)
+
+            result = {
+                "config_name": config_name,
+                "mean_accuracy": cv_results["mean"],
+                "std_accuracy": cv_results["std"],
+                **pipeline_config,
+            }
+            results.append(result)
+
+        return pd.DataFrame(results)
+
+    def optimize_hyperparameters(
+        self, X, y, param_grid: dict[str, list[Any]]
+    ) -> dict[str, Any]:
+        """
+        Optimize pipeline hyperparameters using GridSearchCV.
+        """
+        if self.pipeline is None:
+            self.create_pipeline()
+
+        grid_search = GridSearchCV(
+            self.pipeline, param_grid, cv=5, scoring="accuracy", n_jobs=-1, verbose=1
+        )
+        grid_search.fit(X, y)
+
+        return {
+            "best_params": grid_search.best_params_,
+            "best_score": grid_search.best_score_,
+            "cv_results": grid_search.cv_results_,
+        }
+
+    def get_learning_curves(self, X, y, train_sizes=None) -> dict[str, np.ndarray]:
+        """
+        Generate learning curves for the pipeline.
+        """
+        if self.pipeline is None:
+            self.create_pipeline()
+
+        if train_sizes is None:
+            train_sizes = np.linspace(0.1, 1.0, 10)
+
+        train_sizes_abs, train_scores, val_scores = learning_curve(  # type: ignore
+            self.pipeline,
+            X,
+            y,
+            train_sizes=train_sizes,
+            cv=5,
+            scoring="accuracy",
+            n_jobs=-1,
+            random_state=self.random_state,
+        )
+
+        return {
+            "train_sizes": train_sizes_abs,
+            "train_scores_mean": train_scores.mean(axis=1),
+            "train_scores_std": train_scores.std(axis=1),
+            "val_scores_mean": val_scores.mean(axis=1),
+            "val_scores_std": val_scores.std(axis=1),
+        }
+
+    def save_pipeline(self, filepath: str):
+        """Save the fitted pipeline to disk."""
+        if self.pipeline is None:
+            raise ValueError("No pipeline to save. Create and fit a pipeline first.")
+        joblib.dump(self.pipeline, filepath)
+        print(f"Pipeline saved to {filepath}")
+
+    def load_pipeline(self, filepath: str):
+        """Load a pipeline from disk."""
+        self.pipeline = joblib.load(filepath)
+        print(f"Pipeline loaded from {filepath}")
+
+    def visualize_confusion_matrix(
+        self,
+        y_true,
+        y_pred,
+        title: str = "Confusion Matrix",
+        figsize: tuple[int, int] = (8, 6),
+    ):
+        """Visualize confusion matrix."""
+        cm = confusion_matrix(y_true, y_pred)
+
+        fig, ax = plt.subplots(figsize=figsize)
+        sns.heatmap(
+            cm, annot=True, fmt="d", cmap="Blues", ax=ax, cbar_kws={"label": "Count"}
+        )
+        ax.set_xlabel("Predicted Label", fontweight="bold")
+        ax.set_ylabel("True Label", fontweight="bold")
+        ax.set_title(title, fontweight="bold", pad=20)
+        plt.tight_layout()
+        return fig
+
+    def visualize_roc_curve(
+        self,
+        y_true,
+        y_pred_proba,
+        title: str = "ROC Curve",
+        figsize: tuple[int, int] = (8, 6),
+    ):
+        """Visualize ROC curve."""
+        fpr, tpr, _ = roc_curve(y_true, y_pred_proba)
+        roc_auc = auc(fpr, tpr)
+
+        fig, ax = plt.subplots(figsize=figsize)
+        ax.plot(
+            fpr,
+            tpr,
+            color="darkorange",
+            lw=2,
+            label=f"ROC curve (AUC = {roc_auc:.3f})",
+        )
+        ax.plot(
+            [0, 1],
+            [0, 1],
+            color="navy",
+            lw=2,
+            linestyle="--",
+            label="Random Classifier",
+        )
+        ax.set_xlim([0.0, 1.0])  # type: ignore
+        ax.set_ylim([0.0, 1.05])  # type: ignore
+        ax.set_xlabel("False Positive Rate", fontweight="bold")
+        ax.set_ylabel("True Positive Rate", fontweight="bold")
+        ax.set_title(title, fontweight="bold", pad=20)
+        ax.legend(loc="lower right")
+        ax.grid(alpha=0.3)
+        plt.tight_layout()
+        return fig
+
+    def visualize_learning_curves(
+        self,
+        learning_curve_data: dict[str, np.ndarray],
+        title: str = "Learning Curves",
+        figsize: tuple[int, int] = (10, 6),
+    ):
+        """Visualize learning curves."""
+        train_sizes = learning_curve_data["train_sizes"]
+        train_mean = learning_curve_data["train_scores_mean"]
+        train_std = learning_curve_data["train_scores_std"]
+        val_mean = learning_curve_data["val_scores_mean"]
+        val_std = learning_curve_data["val_scores_std"]
+
+        fig, ax = plt.subplots(figsize=figsize)
+
+        ax.plot(train_sizes, train_mean, "o-", color="blue", label="Training Score")
+        ax.fill_between(
+            train_sizes,
+            train_mean - train_std,
+            train_mean + train_std,
+            alpha=0.2,
+            color="blue",
+        )
+        ax.plot(train_sizes, val_mean, "o-", color="red", label="Validation Score")
+        ax.fill_between(
+            train_sizes,
+            val_mean - val_std,
+            val_mean + val_std,
+            alpha=0.2,
+            color="red",
+        )
+
+        ax.set_xlabel("Training Set Size", fontweight="bold")
+        ax.set_ylabel("Accuracy Score", fontweight="bold")
+        ax.set_title(title, fontweight="bold", pad=20)
+        ax.legend(loc="best")
+        ax.grid(alpha=0.3)
+        plt.tight_layout()
+        return fig
+
+    def visualize_cv_scores(
+        self,
+        cv_scores: np.ndarray,
+        title: str = "Cross-Validation Scores",
+        figsize: tuple[int, int] = (10, 6),
+    ):
+        """
+        Visualize cross-validation scores as box plot.
+        """
+        fig, ax = plt.subplots(figsize=figsize)
+
+        ax.boxplot(
+            [cv_scores],
+            tick_labels=["CV Scores"],
+            patch_artist=True,
+            boxprops={"facecolor": "lightblue"},
+            medianprops={"color": "red", "linewidth": 2},
+            widths=0.5,
+        )
+        ax.scatter(
+            [1] * len(cv_scores),
+            cv_scores,
+            color="darkblue",
+            alpha=0.5,
+            s=50,
+            zorder=3,
+        )
+
+        ax.set_ylabel("Accuracy Score", fontweight="bold")
+        ax.set_title(title, fontweight="bold", pad=20)
+        ax.grid(axis="y", alpha=0.3)
+
+        mean_score = cv_scores.mean()
+        std_score = cv_scores.std()
+        ax.text(
+            1.2,
+            mean_score,
+            f"Mean: {mean_score:.4f}\nStd: {std_score:.4f}",
+            verticalalignment="center",
+            fontsize=10,
+            bbox={"boxstyle": "round", "facecolor": "wheat", "alpha": 0.5},
+        )
+
+        plt.tight_layout()
+        return fig
+
+    def visualize_pipeline_comparison(
+        self,
+        comparison_df: pd.DataFrame,
+        title: str = "Pipeline Configuration Comparison",
+        figsize: tuple[int, int] = (12, 6),
+    ):
+        """Visualize comparison of different pipeline configurations."""
+        fig, ax = plt.subplots(figsize=figsize)
+
+        config_names = comparison_df["config_name"].values
+        means = comparison_df["mean_accuracy"].values
+        stds = comparison_df["std_accuracy"].values
+
+        x_pos = np.arange(len(config_names))
+
+        bars = ax.bar(
+            x_pos,
+            means,  # type: ignore
+            yerr=stds,
+            align="center",
+            alpha=0.7,
+            capsize=10,
+            color="steelblue",
+            edgecolor="black",
+        )
+
+        best_idx = int(np.argmax(means))  # type: ignore
+        bars[best_idx].set_color("gold")
+        bars[best_idx].set_edgecolor("darkgoldenrod")
+
+        ax.set_xticks(x_pos)
+        ax.set_xticklabels(config_names, rotation=45, ha="right")
+        ax.set_ylabel("Mean Accuracy", fontweight="bold")
+        ax.set_title(title, fontweight="bold", pad=20)
+        ax.grid(axis="y", alpha=0.3)
+
+        for i, (mean, std) in enumerate(zip(means, stds)):
+            ax.text(
+                i,
+                mean + std + 0.01,
+                f"{mean:.4f}",
+                ha="center",
+                va="bottom",
+                fontweight="bold",
+            )
+
+        plt.tight_layout()
+        return fig
+
+
+def create_sample_dataset_with_issues(
+    n_samples: int = 1000,
+    n_features: int = 20,
+    missing_rate: float = 0.1,
+    outlier_rate: float = 0.05,
+    random_state: int = 42,
+) -> tuple[pd.DataFrame, pd.Series]:
+    """
+    Create a sample classification dataset with data quality issues.
+    """
+    np.random.seed(random_state)
+
+    X, y = make_classification(
+        n_samples=n_samples,
+        n_features=n_features,
+        n_informative=int(n_features * 0.7),
+        n_redundant=int(n_features * 0.2),
+        n_classes=2,
+        class_sep=1.0,
+        random_state=random_state,
+    )
+
+    X_df = pd.DataFrame(X, columns=[f"feature_{i}" for i in range(n_features)])
+
+    # Inject missing values
+    n_missing = int(n_samples * n_features * missing_rate)
+    missing_indices = np.random.choice(
+        n_samples * n_features, size=n_missing, replace=False
+    )
+    for idx in missing_indices:
+        row = idx // n_features
+        col = idx % n_features
+        X_df.iloc[row, col] = np.nan
+
+    # Inject outliers
+    n_outliers = int(n_samples * outlier_rate)
+    outlier_indices = np.random.choice(n_samples, size=n_outliers, replace=False)
+    for idx in outlier_indices:
+        col = np.random.randint(0, n_features)
+        X_df.iloc[idx, col] = X_df.iloc[idx, col] * np.random.uniform(5, 10)
+
+    return X_df, pd.Series(y, name="target")
+
+
+def _get_config_value(config: pd.Series, key: str, default):
+    """Read a value from a comparison-DataFrame row, falling back to default."""
+    if key not in config.index:
+        return default
+    val = config[key]
+    if pd.isna(val):  # type: ignore
+        return default
+    return val
+
+
+def main():
+    """
+    Main function demonstrating the complete Task 5 workflow.
+    """
+    print("=" * 80)
+    print("Task 5: Integrated Data Preprocessing Pipeline with Cross-Validation")
+    print("=" * 80)
+    print()
+
+    print("Creating sample dataset with quality issues...")
+    X, y = create_sample_dataset_with_issues(
+        n_samples=1000, n_features=20, missing_rate=0.1, outlier_rate=0.05
+    )
+    print(f"Dataset created: {X.shape[0]} samples, {X.shape[1]} features")
+    print(f"Missing values: {X.isna().sum().sum()}")
+    print(f"Target distribution: {y.value_counts().to_dict()}")
+    print()
+
+    pipeline_manager = PreprocessingPipeline(random_state=42)
+
+    # 1. Data splitting
+    print("1. DATA SPLITTING")
+    print("-" * 80)
+    X_train, X_test, y_train, y_test = pipeline_manager.prepare_data(
+        X, y, test_size=0.2
+    )
+    print(f"Training set: {X_train.shape[0]} samples")
+    print(f"Test set: {X_test.shape[0]} samples")
+    print()
+
+    # 2. Baseline pipeline
+    print("2. BASELINE PIPELINE (No Feature Engineering)")
+    print("-" * 80)
+    pipeline_manager.create_pipeline(
+        imputer_strategy="mean",
+        outlier_method="iqr",
+        scaler_type="standard",
+        feature_engineering=False,
+        feature_selection=False,
+    )
+
+    baseline_cv = pipeline_manager.cross_validate(X_train, y_train, cv=5)
+    print(
+        f"Cross-validation accuracy: "
+        f"{baseline_cv['mean']:.4f} (±{baseline_cv['std']:.4f})"
+    )
+    print()
+
+    pipeline_manager.fit_pipeline(X_train, y_train)
+    baseline_test = pipeline_manager.evaluate_pipeline(X_test, y_test)
+    print(f"Test set accuracy: {baseline_test['accuracy']:.4f}")
+    print(f"Test set ROC-AUC: {baseline_test['roc_auc']:.4f}")
+    print()
+
+    # 3. Compare configurations
+    print("3. COMPARING PIPELINE CONFIGURATIONS")
+    print("-" * 80)
+
+    configurations = [
+        {
+            "name": "Baseline",
+            "imputer_strategy": "mean",
+            "outlier_method": "iqr",
+            "scaler_type": "standard",
+            "feature_engineering": False,
+            "feature_selection": False,
+        },
+        {
+            "name": "With Feature Eng",
+            "imputer_strategy": "mean",
+            "outlier_method": "iqr",
+            "scaler_type": "standard",
+            "feature_engineering": True,
+            "feature_selection": False,
+        },
+        {
+            "name": "With Selection",
+            "imputer_strategy": "mean",
+            "outlier_method": "iqr",
+            "scaler_type": "standard",
+            "feature_engineering": False,
+            "feature_selection": True,
+            "n_features": 15,
+        },
+        {
+            "name": "Full Pipeline",
+            "imputer_strategy": "knn",
+            "outlier_method": "iqr",
+            "scaler_type": "robust",
+            "feature_engineering": True,
+            "feature_selection": True,
+            "n_features": 20,
+        },
+    ]
+
+    comparison_df = pipeline_manager.compare_configurations(
+        X_train, y_train, configurations
+    )
+    print("\nConfiguration Comparison:")
+    print(
+        comparison_df[["config_name", "mean_accuracy", "std_accuracy"]].to_string(
+            index=False
+        )
+    )
+    print()
+
+    # 4. Learning curves for best config
+    print("4. GENERATING LEARNING CURVES")
+    print("-" * 80)
+    best_row = comparison_df.loc[comparison_df["mean_accuracy"].idxmax()]
+    print(f"Best configuration: {best_row['config_name']}")
+
+    pipeline_manager.create_pipeline(
+        imputer_strategy=_get_config_value(best_row, "imputer_strategy", "mean"),
+        outlier_method=_get_config_value(best_row, "outlier_method", "none"),
+        scaler_type=_get_config_value(best_row, "scaler_type", "standard"),
+        feature_engineering=bool(
+            _get_config_value(best_row, "feature_engineering", False)
+        ),
+        feature_selection=bool(_get_config_value(best_row, "feature_selection", False)),
+        n_features=int(_get_config_value(best_row, "n_features", 20)),
+    )
+
+    lc_data = pipeline_manager.get_learning_curves(X_train, y_train)
+    print("Learning curves generated")
+    print()
+
+    # 5. Final evaluation
+    print("5. FINAL PIPELINE EVALUATION")
+    print("-" * 80)
+    pipeline_manager.fit_pipeline(X_train, y_train)
+    final_metrics = pipeline_manager.evaluate_pipeline(X_test, y_test)
+    print(f"Final test accuracy: {final_metrics['accuracy']:.4f}")
+    print(f"Final test ROC-AUC: {final_metrics['roc_auc']:.4f}")
+    print()
+
+    y_pred = pipeline_manager.pipeline.predict(X_test)  # type: ignore
+    y_pred_proba = pipeline_manager.pipeline.predict_proba(X_test)[:, 1]  # type: ignore
+
+    # 6. Visualizations
+    print("6. GENERATING VISUALIZATIONS")
+    print("-" * 80)
+
+    pipeline_manager.visualize_confusion_matrix(
+        y_test, y_pred, title="Confusion Matrix - Final Pipeline"
+    )
+    plt.savefig("task5_confusion_matrix.png", dpi=300, bbox_inches="tight")
+
+    pipeline_manager.visualize_roc_curve(
+        y_test, y_pred_proba, title="ROC Curve - Final Pipeline"
+    )
+    plt.savefig("task5_roc_curve.png", dpi=300, bbox_inches="tight")
+
+    pipeline_manager.visualize_learning_curves(
+        lc_data, title="Learning Curves - Best Configuration"
+    )
+    plt.savefig("task5_learning_curves.png", dpi=300, bbox_inches="tight")
+
+    pipeline_manager.visualize_cv_scores(
+        baseline_cv["scores"], title="Cross-Validation Score Distribution"
+    )
+    plt.savefig("task5_cv_scores.png", dpi=300, bbox_inches="tight")
+
+    pipeline_manager.visualize_pipeline_comparison(
+        comparison_df, title="Pipeline Configuration Performance"
+    )
+    plt.savefig("task5_pipeline_comparison.png", dpi=300, bbox_inches="tight")
+    print()
+
+    # 7. Save pipeline
+    print("7. SAVING PIPELINE")
+    print("-" * 80)
+    pipeline_manager.save_pipeline("task5_preprocessing_pipeline.pkl")
+    print()
+
+    print("=" * 80)
+    print("Task 5 completed successfully!")
+    print("=" * 80)
+    print(f"\nBaseline accuracy: {baseline_test['accuracy']:.4f}")
+    print(f"Final accuracy:    {final_metrics['accuracy']:.4f}")
+    print(
+        f"Improvement:       "
+        f"{(final_metrics['accuracy'] - baseline_test['accuracy']):.4f}"
+    )
+    print(f"Best configuration: {best_row['config_name']}")
+
+    return pipeline_manager
+
+
+if __name__ == "__main__":
+    pipeline = main()
+    plt.show()
